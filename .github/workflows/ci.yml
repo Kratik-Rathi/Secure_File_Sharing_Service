@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run test suite
+        env:
+          DATABASE_URL: "sqlite://"
+          SECRET_KEY: "ci-test-secret-not-used-in-production"
+          STORAGE_PATH: "/tmp/ci-uploads"
+          ENVIRONMENT: "test"
+        run: python -m pytest tests/ -v
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t secure-file-sharing:${{ github.sha }} .
+
+      - name: Verify container starts and reports healthy
+        run: |
+          docker run -d --name api -p 8000:8000 \
+            -e DATABASE_URL="sqlite:////tmp/ci.db" \
+            -e SECRET_KEY="ci-smoke-test-secret" \
+            -e ENVIRONMENT="test" \
+            secure-file-sharing:${{ github.sha }}
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:8000/health; then
+              echo "container healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "container failed to become healthy"
+          docker logs api
+          exit 1
+          
