@@ -4,9 +4,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, stat
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.dependencies import get_current_user
 from app.logging_config import get_logger
 from app.models import AuditEvent, FileRecord, User
-from app.dependencies import get_current_user
 from app.schemas import (
     AuditEventOut,
     FileMetadata,
@@ -25,9 +25,17 @@ MAX_FILENAME_LENGTH = 255
 def _clean_filename(name: str | None) -> str:
     if not name or not name.strip():
         return "unnamed"
-    # keep only the base name — discard any path components the client sent
     base = name.replace("\\", "/").split("/")[-1].strip()
     return (base or "unnamed")[:MAX_FILENAME_LENGTH]
+
+
+def _owned_file_or_404(db: Session, file_id: int, user: User) -> FileRecord:
+    record = db.get(FileRecord, file_id)
+    if record is None or record.owner_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
+        )
+    return record
 
 
 @router.post("", response_model=FileMetadata, status_code=status.HTTP_201_CREATED)
@@ -87,22 +95,12 @@ def list_files(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    records = (
+    return (
         db.query(FileRecord)
         .filter(FileRecord.owner_id == current_user.id)
         .order_by(FileRecord.created_at.desc())
         .all()
     )
-    return records
-
-
-def _owned_file_or_404(db: Session, file_id: int, user: User) -> FileRecord:
-    record = db.get(FileRecord, file_id)
-    if record is None or record.owner_id != user.id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
-        )
-    return record
 
 
 @router.get("/{file_id}", response_model=FileMetadata)
@@ -112,6 +110,50 @@ def get_file_metadata(
     current_user: User = Depends(get_current_user),
 ):
     return _owned_file_or_404(db, file_id, current_user)
+
+
+@router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_file(
+    file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    record = _owned_file_or_404(db, file_id, current_user)
+    stored_name = record.stored_name
+    filename = record.original_filename
+
+    # Record the deletion before the row disappears.
+    db.add(
+        AuditEvent(
+            event_type="file_deleted",
+            file_id=record.id,
+            user_id=current_user.id,
+            detail=filename,
+        )
+    )
+    db.commit()
+
+    # Detach audit history from the row being removed. The events are retained
+    # deliberately — an audit trail that disappears with its subject is not an
+    # audit trail. The filename lives on in `detail`.
+    db.query(AuditEvent).filter(AuditEvent.file_id == record.id).update(
+        {AuditEvent.file_id: None}, synchronize_session=False
+    )
+
+    db.delete(record)
+    db.commit()
+
+    # Disk removal last: an orphaned file with no row is recoverable,
+    # a row pointing at a missing file is a broken download.
+    delete_stored_file(stored_name)
+
+    log.info(
+        "file_deleted",
+        file_id=file_id,
+        user_id=current_user.id,
+        filename=filename,
+    )
+    return None
 
 
 @router.post("/{file_id}/sign", response_model=SignedLinkResponse)
@@ -167,10 +209,9 @@ def file_audit_trail(
     current_user: User = Depends(get_current_user),
 ):
     record = _owned_file_or_404(db, file_id, current_user)
-    events = (
+    return (
         db.query(AuditEvent)
         .filter(AuditEvent.file_id == record.id)
         .order_by(AuditEvent.created_at.desc())
         .all()
     )
-    return events

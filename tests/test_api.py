@@ -68,9 +68,12 @@ def test_user_cannot_see_another_users_file(client):
     file_id = upload(client, alice).json()["id"]
 
     assert client.get(f"/files/{file_id}", headers=bob).status_code == 404
-    assert client.post(
-        f"/files/{file_id}/sign", headers=bob, json={"ttl_seconds": 60}
-    ).status_code == 404
+    assert (
+        client.post(
+            f"/files/{file_id}/sign", headers=bob, json={"ttl_seconds": 60}
+        ).status_code
+        == 404
+    )
 
 
 def test_file_list_is_scoped_to_owner(client):
@@ -94,9 +97,12 @@ def test_invalid_ttl_rejected(client):
 
 
 def test_bad_credentials_rejected(client):
-    assert client.post(
-        "/auth/login", json={"username": "alice", "password": "wrong"}
-    ).status_code == 401
+    assert (
+        client.post(
+            "/auth/login", json={"username": "alice", "password": "wrong"}
+        ).status_code
+        == 401
+    )
 
 
 def test_link_generation_is_audited(client):
@@ -106,4 +112,33 @@ def test_link_generation_is_audited(client):
 
     events = client.get(f"/files/{file_id}/audit", headers=headers).json()
     assert any(e["event_type"] == "link_generated" for e in events)
+
+
+def test_delete_file_removes_it(client):
+    headers = auth_header(client, "alice", "alice-pw")
+    file_id = upload(client, headers).json()["id"]
+
+    assert client.delete(f"/files/{file_id}", headers=headers).status_code == 204
+    assert client.get(f"/files/{file_id}", headers=headers).status_code == 404
+    assert client.get("/files", headers=headers).json() == []
+
+
+def test_cannot_delete_another_users_file(client):
+    alice = auth_header(client, "alice", "alice-pw")
+    bob = auth_header(client, "bob", "bob-pw")
+    file_id = upload(client, alice).json()["id"]
+
+    assert client.delete(f"/files/{file_id}", headers=bob).status_code == 404
+    assert client.get(f"/files/{file_id}", headers=alice).status_code == 200
+
+
+def test_deleted_file_link_no_longer_resolves(client):
+    headers = auth_header(client, "alice", "alice-pw")
+    file_id = upload(client, headers).json()["id"]
+    url = client.post(
+        f"/files/{file_id}/sign", headers=headers, json={"ttl_seconds": 300}
+    ).json()["download_url"]
+
+    client.delete(f"/files/{file_id}", headers=headers)
+    assert client.get(url.replace("http://testserver", "")).status_code == 404
     
