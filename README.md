@@ -2,13 +2,16 @@
 
 A REST API for uploading private files and sharing them via time-limited, cryptographically signed download links.
 
-Files are stored outside any publicly served path. The only way bytes leave the service is through a signed link whose signature and expiry are verified on every request. Every link generation and redemption is recorded in a durable audit trail.
+Files are stored outside any publicly served path. The only way bytes leave the service is through a signed link whose signature and expiry are verified on every request. Every link generation, redemption, rejection, and deletion is recorded in a durable audit trail.
+
+Two interfaces are provided: the interactive OpenAPI docs at `/docs` cover the full API surface, and a minimal React client demonstrates the end-to-end flow.
 
 ---
 
 ## Contents
 
 - [Quick start](#quick-start)
+- [Interfaces](#interfaces)
 - [Configuration](#configuration)
 - [API reference](#api-reference)
 - [End-to-end example](#end-to-end-example)
@@ -23,7 +26,9 @@ Files are stored outside any publicly served path. The only way bytes leave the 
 
 ## Quick start
 
-Requirements: Python 3.11+, PostgreSQL 14+.
+Requirements: Python 3.11+, PostgreSQL 14+, Node 18+ (frontend only).
+
+### Backend
 
 ```bash
 # 1. Database
@@ -42,8 +47,15 @@ cp .env.example .env        # then edit values
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Interactive API docs: `http://localhost:8000/docs`
-Health check: `http://localhost:8000/health`
+### Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev                 # http://localhost:5173
+```
+
+Requires the API running on port 8000.
 
 Tables are created on first startup. Demo users are seeded **only** when `ENVIRONMENT=development`.
 
@@ -54,7 +66,28 @@ Tables are created on first startup. Demo users are seeded **only** when `ENVIRO
 | `alice` | `alice-password` |
 | `bob` | `bob-password` |
 
-Override with `SEED_PASSWORD_ALICE` / `SEED_PASSWORD_BOB` if desired. In any other environment no accounts are created at all — seeding is gated in `app/main.py`, and a `demo_users_seeded` warning is logged whenever it runs, so it is visible if it ever executes somewhere unexpected.
+Override with `SEED_PASSWORD_ALICE` / `SEED_PASSWORD_BOB`. In any other environment no accounts are created at all — seeding is gated in `app/main.py`, and a `demo_users_seeded` warning is logged whenever it runs, so it is visible if it ever executes somewhere unexpected.
+
+---
+
+## Interfaces
+
+### OpenAPI docs — `http://localhost:8000/docs`
+
+The complete API surface, generated from the route definitions and Pydantic schemas. Click **Authorize**, paste an access token from `POST /auth/login`, and every endpoint is callable directly. This is the authoritative interface and stays in sync with the code automatically.
+
+### React client — `http://localhost:5173`
+
+A deliberately minimal client covering login, upload, file listing, link generation, deletion, and audit inspection. It exists to demonstrate the end-to-end flow visually; it is not a product surface and duplicates only part of the API.
+
+Signed links open in a new tab and carry no credentials — which demonstrates the core property directly: a link works in any browser, including a fresh incognito window, until it expires.
+
+Two client-side decisions worth noting:
+
+- **The access token lives in React state only**, never in `localStorage` or `sessionStorage`. A persisted token is readable by any injected script. The trade-off is that a page refresh requires re-authentication. A production client would use an httpOnly cookie with CSRF protection.
+- **CORS origins are allowlisted explicitly** in `CORSMiddleware` rather than using a wildcard. For deployment this should be driven by an environment variable.
+
+Any `401` from the API clears client state and returns to the login screen, so an expired token degrades cleanly rather than producing a broken view.
 
 ---
 
@@ -87,17 +120,21 @@ All configuration comes from environment variables. Nothing is hardcoded. The ap
 | `POST` | `/files` | Bearer | Upload a file (multipart) |
 | `GET` | `/files` | Bearer | List the caller's files |
 | `GET` | `/files/{id}` | Bearer | Metadata for one owned file |
+| `DELETE` | `/files/{id}` | Bearer | Delete an owned file and its stored bytes |
 | `POST` | `/files/{id}/sign` | Bearer | Generate a signed download link |
 | `GET` | `/files/{id}/audit` | Bearer | Audit trail for one owned file |
 | `GET` | `/download` | **none** | Redeem a signed link |
 
 `/download` is intentionally unauthenticated. The signature *is* the authorization — that is what makes links shareable.
 
+The audit trail is visible to the file's owner only. A download recipient sees nothing beyond the file itself.
+
 ### Status codes
 
 | Code | Meaning |
 |---|---|
 | `201` | File uploaded |
+| `204` | File deleted |
 | `400` | Empty upload |
 | `401` | Missing, malformed, or expired JWT; bad credentials |
 | `403` | Invalid download signature |
@@ -106,7 +143,7 @@ All configuration comes from environment variables. Nothing is hardcoded. The ap
 | `422` | Request validation failed (e.g. `ttl_seconds` out of range) |
 | `500` | Unhandled error — generic message to client, full trace in logs |
 
-Requesting a file owned by another user returns `404`, not `403`. A `403` would confirm the file exists.
+Requesting or deleting a file owned by another user returns `404`, not `403`. A `403` would confirm the file exists.
 
 ### Error format
 
@@ -161,6 +198,10 @@ curl -s -o /dev/null -w "%{http_code}\n" "${URL:0:-1}0"
 
 # Inspect the audit trail
 curl -s $BASE/files/$FILE_ID/audit -H "Authorization: Bearer $TOKEN" | jq
+
+# Delete the file (204)
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE \
+  $BASE/files/$FILE_ID -H "Authorization: Bearer $TOKEN"
 ```
 
 ---
@@ -185,9 +226,19 @@ The signature is checked *before* any database lookup, so the endpoint cannot be
 
 ### Audit trail
 
-Recorded in `audit_events`: `file_uploaded`, `link_generated`, `link_redeemed`, `signature_rejected`, `link_expired`.
+Recorded in `audit_events`: `file_uploaded`, `link_generated`, `link_redeemed`, `signature_rejected`, `link_expired`, `file_deleted`.
 
 Events are written to Postgres *and* emitted as structured logs. These are not redundant: logs are ephemeral and best-effort, the audit table is durable and queryable. `signature_rejected` is stored with a null `file_id` — a forged signature cannot be trusted to identify a real file, so it is not attributed to one.
+
+### Deletion
+
+`DELETE /files/{id}` removes the database row and the stored bytes, and records a `file_deleted` audit event.
+
+Audit history is deliberately retained: events for the deleted file have their `file_id` set to null rather than being cascaded away, with the filename preserved in `detail`. An audit trail that disappears along with its subject cannot answer the questions an audit trail exists for.
+
+The row is committed before the file is unlinked from disk. An orphaned file with no row wastes space but breaks nothing; a row pointing at missing bytes is a failed download on a link that was promised to work.
+
+Deleting a file invalidates any outstanding signed links for it, which then return `404`.
 
 ---
 
@@ -197,14 +248,16 @@ Events are written to Postgres *and* emitted as structured logs. These are not r
 python -m pytest tests/ -v
 ```
 
-16 tests, no external services required. Tests run against in-memory SQLite via FastAPI dependency overrides, so the suite is fast, isolated, and runs unchanged in CI.
+19 tests, no external services required. Tests run against in-memory SQLite via FastAPI dependency overrides, so the suite is fast, isolated, and runs unchanged in CI.
 
 Coverage focuses on the security-critical paths:
 
 - Signature round-trip, and binding to **both** file ID and expiry
 - Tampered signature rejected (`403`)
 - Expired link rejected (`410`)
-- Cross-user access denied; file listings scoped to owner
+- Cross-user access and cross-user deletion denied
+- File listings scoped to owner
+- Deletion removes the file and invalidates outstanding links
 - TTL bounds enforced
 - Link generation recorded in the audit trail
 
@@ -227,11 +280,20 @@ app/
 ├── logging_config.py  structlog + request-ID context
 └── routers/
     ├── auth.py        login
-    ├── files.py       upload, list, metadata, sign, audit
+    ├── files.py       upload, list, metadata, delete, sign, audit
     └── download.py    public signed download
+
+frontend/
+└── src/App.jsx        minimal React client
+
+tests/
+├── test_signing.py    pure unit tests — no DB, no HTTP
+└── test_api.py        route-level integration tests
 ```
 
 ORM models and API schemas are deliberately separate classes. Coupling them would make a column rename a breaking API change and would risk exposing internal fields — `password_hash` and `stored_name` are never serializable by accident.
+
+Signing logic is isolated in `security.py` as pure functions, which is why it can be unit-tested without a database, a request, or any fixtures. It is the part of the system where a bug is most costly.
 
 ---
 
@@ -248,6 +310,8 @@ ORM models and API schemas are deliberately separate classes. Coupling them woul
 | Information disclosure | Unhandled exceptions return a generic message plus a request ID; the stack trace goes to logs only. |
 | Memory exhaustion | Uploads stream to disk in 1 MiB chunks rather than being buffered whole. |
 | Orphaned data | A failed metadata commit rolls back and deletes the file already written to disk. |
+| Token exposure in the browser | The React client holds the token in memory only, never in browser storage. |
+| Overly permissive CORS | Origins are allowlisted explicitly rather than using a wildcard. |
 
 Uploads are never served from a static mount. Mounting `STORAGE_PATH` statically would bypass signature verification entirely and defeat the purpose of the service.
 
@@ -259,10 +323,19 @@ Runtime requirements: a stable `SECRET_KEY`, a reachable PostgreSQL instance, an
 
 The persistence requirement rules out stateless platforms. On DigitalOcean App Platform, the container filesystem is wiped on every redeploy and uploads would be lost. Suitable targets:
 
-- **Droplet + Docker with a bind-mounted host directory** — satisfies the local-filesystem requirement. Attaching a Block Storage Volume separates the data lifecycle from the compute lifecycle.
+- **Droplet + Docker with a bind-mounted host directory** — satisfies the local-filesystem requirement. Attaching a Block Storage Volume separates the data lifecycle from the compute lifecycle, so the data survives rebuilding the Droplet.
 - **Object storage (Spaces / S3)** — the correct production answer at scale, and the necessary change before running more than one instance.
 
 Bind to `0.0.0.0`, not `127.0.0.1`, or the platform cannot route traffic to the container.
+
+### CI
+
+GitHub Actions runs on every push and on pull requests targeting `main`:
+
+- **Tests** — the full suite, with no database service required
+- **Docker build** — builds the image, runs it, and polls `/health` until it responds, so a container that builds but fails to start also fails CI
+
+Branch strategy: work lands on `staging`, reaches `main` only through a pull request, and `main` requires both checks to pass before merge.
 
 ---
 
@@ -277,3 +350,5 @@ Deliberate scope decisions, not oversights:
 - **No rate limiting** on login or link generation.
 - **Tests run against SQLite.** The query surface is kept dialect-agnostic, but a PostgreSQL service container in CI would close the gap.
 - **Users are seeded, not registered.** Registration is well-understood CRUD; the time went to the signing and audit paths instead. Seeding is gated to development, so production starts with no accounts — a real deployment would need either a registration endpoint or provisioning through an identity provider.
+- **Signed links are not single-use.** A link can be redeemed any number of times until it expires. Enforcing single use would require recording redemption state, which is a straightforward addition to the existing audit table.
+- **CORS origins are hardcoded** for local development rather than environment-driven.
